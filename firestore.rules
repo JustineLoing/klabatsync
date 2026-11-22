@@ -1,0 +1,299 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function hasAdminRecord() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function adminRecord() {
+      return get(/databases/$(database)/documents/admins/$(request.auth.uid)).data;
+    }
+
+    function activeAdmin(role) {
+      return hasAdminRecord()
+        && adminRecord().status == 'active'
+        && adminRecord().role == role;
+    }
+
+    function isSuperAdmin() {
+      return activeAdmin('super_admin');
+    }
+
+    function isCampusAdmin() {
+      return activeAdmin('campus_admin');
+    }
+
+    function isStudent() {
+      return signedIn()
+        && !hasAdminRecord()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email is string
+        && request.auth.token.email.matches('.*@student[.]unklab[.]ac[.]id$');
+    }
+
+    function isOrgScopedAdmin() {
+      return hasAdminRecord()
+        && adminRecord().status == 'active'
+        && adminRecord().role in [
+          'organization_admin',
+          'ormawa_admin',
+          'dormitory_admin',
+          'spiritual_admin'
+        ];
+    }
+
+    function isAdminForOrganization(orgId) {
+      return orgId is string
+        && isOrgScopedAdmin()
+        && adminRecord().organizationId == orgId;
+    }
+
+    function isInAdminCategory(category) {
+      return adminRecord().role == 'organization_admin'
+        || (adminRecord().role == 'ormawa_admin' && category == 'ormawa')
+        || (adminRecord().role == 'dormitory_admin' && category == 'dormitory')
+        || (adminRecord().role == 'spiritual_admin' && category == 'spiritual');
+    }
+
+    function canManageScopedCategory(orgId, category) {
+      return isAdminForOrganization(orgId) && isInAdminCategory(category);
+    }
+
+    function canReadOrganization(orgId) {
+      return isSuperAdmin() || isCampusAdmin() || isAdminForOrganization(orgId);
+    }
+
+    function canManageRegistration(data) {
+      return isSuperAdmin()
+        || isCampusAdmin()
+        || canManageScopedCategory(data.get('organizationId', null), data.get('category', null));
+    }
+
+    function validEvent(data) {
+      return data.id is string
+        && data.title is string
+        && data.description is string
+        && data.category in ['spiritual', 'academic', 'ormawa', 'dormitory', 'seminar', 'competition']
+        && data.startDate is string
+        && data.startTime is string
+        && data.location is string
+        && data.status in ['draft', 'pending', 'published', 'rejected', 'cancelled', 'completed']
+        && data.isDemo == false;
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isSuperAdmin());
+      allow create: if isStudent()
+        && request.auth.uid == uid
+        && request.resource.data.get('email', '') == request.auth.token.email
+        && !request.resource.data.keys().hasAny(['role', 'adminRole', 'organizationId', 'permissionScope'])
+        && request.resource.data.keys().hasOnly([
+          'id',
+          'fullName',
+          'nim',
+          'email',
+          'faculty',
+          'studyProgram',
+          'batch',
+          'residenceStatus',
+          'dormitoryBuilding',
+          'studentStatus',
+          'avatarUrl'
+        ]);
+      allow update: if isStudent()
+        && request.auth.uid == uid
+        && request.resource.data.get('email', '') == request.auth.token.email
+        && !request.resource.data.keys().hasAny(['role', 'adminRole', 'organizationId', 'permissionScope'])
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'fullName',
+          'nim',
+          'faculty',
+          'studyProgram',
+          'batch',
+          'residenceStatus',
+          'dormitoryBuilding',
+          'studentStatus',
+          'avatarUrl'
+        ]);
+      allow delete: if false;
+
+      match /bookmarks/{eventId} {
+        allow read: if isStudent() && request.auth.uid == uid;
+        allow create, update: if isStudent()
+          && request.auth.uid == uid
+          && request.resource.data.get('eventId', '') == eventId
+          && request.resource.data.keys().hasOnly(['eventId', 'createdAt']);
+        allow delete: if isStudent() && request.auth.uid == uid;
+      }
+
+      match /agenda/{eventId} {
+        allow read: if isStudent() && request.auth.uid == uid;
+        allow create, update: if isStudent()
+          && request.auth.uid == uid
+          && validEvent(request.resource.data)
+          && request.resource.data.id == eventId;
+        allow delete: if isStudent() && request.auth.uid == uid;
+      }
+
+      match /announcementReads/{announcementId} {
+        allow read: if isStudent() && request.auth.uid == uid;
+        allow create, update: if isStudent()
+          && request.auth.uid == uid
+          && request.resource.data.get('announcementId', '') == announcementId
+          && request.resource.data.keys().hasOnly(['announcementId', 'readAt']);
+        allow delete: if isStudent() && request.auth.uid == uid;
+      }
+    }
+
+    match /admins/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isSuperAdmin());
+      allow create, update, delete: if false;
+    }
+
+    match /organizations/{orgId} {
+      allow read: if (isStudent() && resource.data.status == 'active')
+        || (!isStudent() && canReadOrganization(orgId));
+      allow create: if isSuperAdmin()
+        && request.resource.data.id == orgId
+        && request.resource.data.status in ['active', 'inactive', 'archived'];
+      allow update: if isSuperAdmin()
+        || (
+          isAdminForOrganization(orgId)
+          && request.resource.data.id == resource.data.id
+          && request.resource.data.status == resource.data.status
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'description',
+            'logoUrl',
+            'coverImageUrl',
+            'email',
+            'contactPerson',
+            'contactEmail',
+            'contactPhone',
+            'location',
+            'socialLinks',
+            'updatedAt'
+          ])
+        );
+      allow delete: if isSuperAdmin();
+    }
+
+    match /events/{eventId} {
+      allow read: if isSuperAdmin()
+        || isCampusAdmin()
+        || (isStudent() && resource.data.status == 'published')
+        || canManageScopedCategory(
+          resource.data.get('organizationId', null),
+          resource.data.get('category', null)
+        );
+      allow create: if validEvent(request.resource.data)
+        && request.resource.data.id == eventId
+        && (
+          isSuperAdmin()
+          || isCampusAdmin()
+          || canManageScopedCategory(
+            request.resource.data.get('organizationId', null),
+            request.resource.data.get('category', null)
+          )
+        );
+      allow update: if validEvent(request.resource.data)
+        && request.resource.data.id == resource.data.id
+        && request.resource.data.get('organizationId', null) == resource.data.get('organizationId', null)
+        && (
+          isSuperAdmin()
+          || isCampusAdmin()
+          || canManageScopedCategory(
+            resource.data.get('organizationId', null),
+            resource.data.get('category', null)
+          )
+        );
+      allow delete: if isSuperAdmin()
+        || isCampusAdmin()
+        || canManageScopedCategory(
+          resource.data.get('organizationId', null),
+          resource.data.get('category', null)
+        );
+    }
+
+    match /registrations/{registrationId} {
+      allow read: if (isStudent() && request.auth.uid == resource.data.studentId)
+        || canManageRegistration(resource.data);
+      allow create: if isStudent()
+        && request.auth.uid == request.resource.data.studentId
+        && request.resource.data.id == registrationId
+        && request.resource.data.status in ['going', 'interested']
+        && request.resource.data.attendanceStatus == 'not_checked_in'
+        && get(/databases/$(database)/documents/events/$(request.resource.data.eventId)).data.status == 'published'
+        && request.resource.data.category
+          == get(/databases/$(database)/documents/events/$(request.resource.data.eventId)).data.category;
+      allow update: if (
+        isStudent()
+        && request.auth.uid == resource.data.studentId
+        && request.resource.data.status in ['going', 'interested']
+        && request.resource.data.attendanceStatus == resource.data.attendanceStatus
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'status',
+          'registrationToken'
+        ])
+      ) || (
+        canManageRegistration(resource.data)
+        && request.resource.data.studentId == resource.data.studentId
+        && request.resource.data.eventId == resource.data.eventId
+        && request.resource.data.get('organizationId', null) == resource.data.get('organizationId', null)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'attendanceStatus',
+          'checkedInAt'
+        ])
+      );
+      allow delete: if (
+        isStudent()
+        && request.auth.uid == resource.data.studentId
+        && resource.data.attendanceStatus != 'checked_in'
+      ) || canManageRegistration(resource.data);
+    }
+
+    match /announcements/{announcementId} {
+      allow read: if isStudent()
+        || isSuperAdmin()
+        || isCampusAdmin()
+        || canManageScopedCategory(
+          resource.data.get('organizationId', null),
+          resource.data.get('category', null)
+        );
+      allow create: if request.resource.data.id == announcementId
+        && (
+          isSuperAdmin()
+          || isCampusAdmin()
+          || canManageScopedCategory(
+            request.resource.data.get('organizationId', null),
+            request.resource.data.get('category', null)
+          )
+        );
+      allow update: if (
+        isSuperAdmin()
+        || isCampusAdmin()
+        || canManageScopedCategory(
+          resource.data.get('organizationId', null),
+          resource.data.get('category', null)
+        )
+      )
+        && request.resource.data.id == resource.data.id
+        && request.resource.data.get('organizationId', null) == resource.data.get('organizationId', null);
+      allow delete: if isSuperAdmin()
+        || isCampusAdmin()
+        || canManageScopedCategory(
+          resource.data.get('organizationId', null),
+          resource.data.get('category', null)
+        );
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
