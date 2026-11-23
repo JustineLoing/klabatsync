@@ -13,6 +13,7 @@ chrome_temp_profile
 
 # Internal Markdown notes, presentation scripts & docs
 *.md
+!README.md
 docs/
 
 # Logs
